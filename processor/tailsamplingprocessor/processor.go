@@ -58,6 +58,7 @@ type tailSamplingSpanProcessor struct {
 	sampledIDCache  cache.Cache[bool]
 	deleteChan      chan pcommon.TraceID
 	numTracesOnMap  *atomic.Uint64
+	samplingRates   map[string]float64
 }
 
 // spanAndScope a structure for holding information about span and its instrumentation scope.
@@ -119,6 +120,7 @@ func newTracesProcessor(ctx context.Context, settings component.TelemetrySetting
 	if tsp.policies == nil {
 		policyNames := map[string]bool{}
 		tsp.policies = make([]*policy, len(cfg.PolicyCfgs))
+		tsp.samplingRates = make(map[string]float64, len(cfg.PolicyCfgs))
 		for i := range cfg.PolicyCfgs {
 			policyCfg := &cfg.PolicyCfgs[i]
 
@@ -137,6 +139,11 @@ func newTracesProcessor(ctx context.Context, settings component.TelemetrySetting
 				attribute: metric.WithAttributes(attribute.String("policy", policyCfg.Name)),
 			}
 			tsp.policies[i] = p
+			if policyCfg.Type == Probabilistic {
+				tsp.samplingRates[policyCfg.Name] = policyCfg.ProbabilisticCfg.SamplingPercentage
+			} else {
+				tsp.samplingRates[policyCfg.Name] = 100.0
+			}
 		}
 	}
 
@@ -292,6 +299,7 @@ func (tsp *tailSamplingSpanProcessor) makeDecision(id pcommon.TraceID, trace *sa
 		sampling.InvertSampled:    false,
 		sampling.InvertNotSampled: false,
 	}
+	samplingRate := 0.0
 
 	ctx := context.Background()
 	// Check all policies before making a final decision
@@ -311,6 +319,10 @@ func (tsp *tailSamplingSpanProcessor) makeDecision(id pcommon.TraceID, trace *sa
 
 			samplingDecision[decision] = true
 		}
+
+		if decision == sampling.Sampled {
+			samplingRate = max(tsp.samplingRates[p.name], samplingRate)
+		}
 	}
 
 	// InvertNotSampled takes precedence over any other decision
@@ -321,6 +333,19 @@ func (tsp *tailSamplingSpanProcessor) makeDecision(id pcommon.TraceID, trace *sa
 		finalDecision = sampling.Sampled
 	case samplingDecision[sampling.InvertSampled] && !samplingDecision[sampling.NotSampled]:
 		finalDecision = sampling.Sampled
+	}
+
+	if finalDecision == sampling.Sampled {
+		for i := 0; i < trace.ReceivedBatches.ResourceSpans().Len(); i++ {
+			rs := trace.ReceivedBatches.ResourceSpans().At(i)
+			for j := 0; j < rs.ScopeSpans().Len(); j++ {
+				ss := rs.ScopeSpans().At(j)
+				for k := 0; k < rs.ScopeSpans().At(j).Spans().Len(); k++ {
+					span := ss.Spans().At(k)
+					span.Attributes().PutDouble("SampleRate", samplingRate)
+				}
+			}
+		}
 	}
 
 	return finalDecision
